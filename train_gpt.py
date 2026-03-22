@@ -29,7 +29,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+except ImportError:
+    flash_attn_3_func = None
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -112,6 +115,8 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_online = bool(int(os.environ.get("TTT_ONLINE", "1")))
+    ttt_duplicate = bool(int(os.environ.get("TTT_DUPLICATE", "1")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
@@ -825,6 +830,7 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        self.ttt_blocks = None  # populated by ttt_setup at test time
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -850,13 +856,19 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
+        ttt = self.ttt_blocks
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
+            if ttt is not None and str(i) in ttt:
+                x = ttt[str(i)](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = self.num_encoder_layers + i
+            x = self.blocks[block_idx](x, x0)
+            if ttt is not None and str(block_idx) in ttt:
+                x = ttt[str(block_idx)](x, x0)
 
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -889,8 +901,12 @@ class GPT(nn.Module):
 
         return main_loss
 
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
-        """Return logits (bsz, seq_len, vocab) without computing loss."""
+    def forward_logits(self, input_ids: Tensor, detach_after_block: int = -1) -> Tensor:
+        """Return logits (bsz, seq_len, vocab) without computing loss.
+
+        If detach_after_block >= 0, detach x and x0 after that block index.
+        This skips backprop through earlier (frozen) blocks for efficiency.
+        """
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -898,13 +914,26 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
+        ttt = self.ttt_blocks
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
+            if ttt is not None and str(i) in ttt:
+                x = ttt[str(i)](x, x0)
+            if i == detach_after_block:
+                x = x.detach()
+                x0 = x0.detach()
+                skips = [s.detach() for s in skips]
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            block_idx = self.num_encoder_layers + i
+            x = self.blocks[block_idx](x, x0)
+            if ttt is not None and str(block_idx) in ttt:
+                x = ttt[str(block_idx)](x, x0)
+            if block_idx == detach_after_block:
+                x = x.detach()
+                x0 = x0.detach()
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1085,7 +1114,11 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
 # -----------------------------
 
 def ttt_adapt(args, base_model, device, val_tokens, rank=0, world_size=1, log_fn=None):
-    """Full-weight TTT: SGD adaptation on val data with DDP across all GPUs."""
+    """Original TTT: in-place SGD adaptation on val data before eval.
+
+    WARNING: trains on all eval tokens before scoring — see issue #402.
+    Use TTT_DUPLICATE=1 for the correct online approach.
+    """
     seq_len = args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // seq_len
     batch_seqs = args.ttt_batch_seqs
@@ -1148,6 +1181,147 @@ def ttt_adapt(args, base_model, device, val_tokens, rank=0, world_size=1, log_fn
 
     if log_fn:
         log_fn(f"ttt:done elapsed={time.perf_counter()-t0:.1f}s")
+
+
+def ttt_setup(args, base_model, device, log_fn=None):
+    """Create duplicate blocks for test-time training (no training yet).
+
+    For each block with index >= ttt_freeze_blocks, a deep copy is created
+    and inserted after the original in the forward pass. Both the original
+    and duplicate are trained, effectively growing the model at test time.
+    Only blocks < ttt_freeze_blocks are frozen.
+    """
+    # Freeze only the early blocks
+    for i, block in enumerate(base_model.blocks):
+        if i < args.ttt_freeze_blocks:
+            for p in block.parameters():
+                p.requires_grad_(False)
+
+    # Duplicate non-frozen blocks
+    ttt_blocks = nn.ModuleDict()
+    for i, block in enumerate(base_model.blocks):
+        if i >= args.ttt_freeze_blocks:
+            dup = copy.deepcopy(block)
+            ttt_blocks[str(i)] = dup
+    base_model.ttt_blocks = ttt_blocks.to(device)
+
+    num_dup = len(ttt_blocks)
+    if log_fn:
+        log_fn(f"ttt:duplicated {num_dup} blocks (indices {args.ttt_freeze_blocks}..{len(base_model.blocks)-1})")
+
+
+def eval_val_sliding_with_ttt(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    eval_seq_len: int | None = None,
+    log_fn=None,
+) -> tuple[float, float]:
+    """Sliding window eval with online TTT — score each window, then adapt.
+
+    Correct per github.com/openai/parameter-golf/issues/402:
+    each window is scored BEFORE the model adapts on it.
+    Windows are processed sequentially so each benefits from prior adaptations.
+
+    Works in two modes:
+    - Duplicate (ttt_blocks is not None): trains originals + duplicate blocks.
+    - In-place (ttt_blocks is None): trains the original non-frozen params.
+
+    Exact optimizations (no change to results):
+    - Detaches after the last frozen block to skip its backward pass.
+    - Pre-allocates x/y tensors and reuses them across windows.
+    """
+    seq_len = eval_seq_len or args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+
+    ttt_params = [p for p in base_model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+
+    # Detach is not safe here: embeddings and non-frozen original blocks are
+    # trainable in both in-place and duplicate modes, so we need full backprop.
+    detach_block = -1
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # Pre-allocate tensors reused each iteration
+    x = torch.zeros(1, seq_len, dtype=torch.int64, device=device)
+    y = torch.zeros(1, seq_len, dtype=torch.int64, device=device)
+
+    base_model.train()
+    t0 = time.perf_counter()
+    log_every = max(1, total_windows // 10)
+
+    for wi, ws in enumerate(window_starts):
+        end = min(ws + seq_len, total_tokens)
+        wlen = end - ws
+        chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+
+        x.zero_()
+        y.zero_()
+        x[0, :wlen] = chunk[:-1]
+        y[0, :wlen] = chunk[1:]
+
+        # Forward pass (detach after frozen blocks to save backward compute)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = base_model.forward_logits(x, detach_after_block=detach_block)
+
+        nll = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)).float(),
+            y.reshape(-1),
+            reduction="none",
+        ).reshape(1, seq_len)
+
+        # Step 1: SCORE the new tokens (before adaptation)
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        scored_nll = nll[0, s:wlen].detach().to(torch.float64)
+        loss_sum += scored_nll.sum()
+        token_count += float(wlen - s)
+        tgt = y[0, s:wlen]
+        prev = x[0, s:wlen]
+        tb = base_bytes_lut[tgt].to(torch.float64)
+        tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+        byte_count += tb.sum()
+
+        # Step 2: ADAPT on this window (after scoring)
+        adapt_loss = nll[0, :wlen].mean()
+        adapt_loss.backward()
+        torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
+        optimizer.step()
+
+        if log_fn and (wi + 1) % log_every == 0:
+            elapsed = time.perf_counter() - t0
+            pct = 100.0 * (wi + 1) / total_windows
+            avg_loss = (loss_sum / token_count).item()
+            log_fn(f"ttt_online: {wi+1}/{total_windows} ({pct:.0f}%) avg_loss:{avg_loss:.4f} time:{elapsed:.1f}s")
+
+    # All GPUs process all windows identically — no all-reduce needed
+
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+
+    if log_fn:
+        log_fn(f"ttt_online:done windows:{total_windows} elapsed:{time.perf_counter()-t0:.1f}s")
+
+    base_model.eval()
+    return val_loss, bits_per_token * tokens_per_byte
 
 
 # -----------------------------
@@ -1611,20 +1785,19 @@ def main() -> None:
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
 
-    # TTT: adapt model on validation data before eval
-    if args.ttt_enabled:
+    # TTT (original batch, leaking): adapt on all eval tokens before scoring
+    if args.ttt_enabled and not args.ttt_online:
         if distributed:
             dist.barrier()
-        log0(f"ttt:start lr={args.ttt_lr} momentum={args.ttt_momentum} epochs={args.ttt_epochs} freeze_blocks={args.ttt_freeze_blocks}")
+        log0(f"ttt:start mode=batch lr={args.ttt_lr} momentum={args.ttt_momentum} epochs={args.ttt_epochs} freeze_blocks={args.ttt_freeze_blocks}")
         t_ttt = time.perf_counter()
         ttt_adapt(args, eval_model, device, val_tokens, rank=rank, world_size=world_size, log_fn=log0)
         log0(f"ttt:elapsed={time.perf_counter() - t_ttt:.1f}s")
         if distributed:
             dist.barrier()
 
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True) if os.environ.get("TORCH_COMPILE","1")!="0" else eval_model
-
     # Standard non-overlapping eval (sanity check)
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True) if os.environ.get("TORCH_COMPILE","1")!="0" else eval_model
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1642,23 +1815,51 @@ def main() -> None:
     # Sliding window eval (submission score)
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
-        torch.cuda.synchronize()
-        t_slide = time.perf_counter()
-        sw_val_loss, sw_val_bpb = eval_val_sliding(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride,
-            eval_seq_len=sw_seq_len,
-        )
-        torch.cuda.synchronize()
+        if args.ttt_enabled and args.ttt_online:
+            # Online TTT: score each window, then adapt (no leakage)
+            if distributed:
+                dist.barrier()
+            if args.ttt_duplicate:
+                log0(f"ttt:setup mode=online+duplicate lr={args.ttt_lr} momentum={args.ttt_momentum} freeze_blocks={args.ttt_freeze_blocks}")
+                ttt_setup(args, eval_model, device, log_fn=log0)
+            else:
+                log0(f"ttt:setup mode=online+inplace lr={args.ttt_lr} momentum={args.ttt_momentum} freeze_blocks={args.ttt_freeze_blocks}")
+                # Freeze early blocks, train the rest in-place
+                for i, block in enumerate(eval_model.blocks):
+                    if i < args.ttt_freeze_blocks:
+                        for p in block.parameters():
+                            p.requires_grad_(False)
+            torch.cuda.synchronize()
+            t_slide = time.perf_counter()
+            sw_val_loss, sw_val_bpb = eval_val_sliding_with_ttt(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+                eval_seq_len=sw_seq_len,
+                log_fn=log0,
+            )
+            torch.cuda.synchronize()
+        else:
+            torch.cuda.synchronize()
+            t_slide = time.perf_counter()
+            sw_val_loss, sw_val_bpb = eval_val_sliding(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride,
+                eval_seq_len=sw_seq_len,
+            )
+            torch.cuda.synchronize()
         log0(
             f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
             f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
-    # Second sliding window eval at stride=64 for submission comparison
+    # Second sliding window eval at stride=64 for submission comparison (no TTT — use base model)
     if args.eval_stride != 64 and 64 < sw_seq_len:
+        # Reset ttt_blocks so second eval uses vanilla model
+        saved_ttt = eval_model.ttt_blocks
+        eval_model.ttt_blocks = None
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
         sw64_val_loss, sw64_val_bpb = eval_val_sliding(
@@ -1667,6 +1868,7 @@ def main() -> None:
             stride=64,
             eval_seq_len=sw_seq_len,
         )
+        eval_model.ttt_blocks = saved_ttt
         torch.cuda.synchronize()
         log0(
             f"final_int6_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} "
