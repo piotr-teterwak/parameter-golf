@@ -1,78 +1,64 @@
 """
-train_gpt_submit.py â€” Submission v2: wider MLP + STE int6 QAT + MTP + seq2048 + NTK RoPE +
-fp16 embed + late-K passthrough + sliding window eval.
-"""
-
-from __future__ import annotations
-
-import copy
-import glob
-import io
-import math
-import os
-import random
-import subprocess
-import sys
-import time
-import uuid
-import zlib
-from pathlib import Path
-
-import zstandard
-_COMPRESSOR = "zstd"
-
-import numpy as np
-import sentencepiece as spm
-import torch
-import torch.distributed as dist
-import torch.nn.functional as F
-from torch import Tensor, nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-try:
-    from flash_attn_interface import flash_attn_func as flash_attn_3_func
-except ImportError:
-    flash_attn_3_func = None
-
-# -----------------------------
-# HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
-class Hyperparameters:
-    # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
-    train_files = os.path.join(data_path, "fineweb_train_*.bin")
-    val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
-    seed = int(os.environ.get("SEED", 1337))
-
-    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
-    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-
-    # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-
-    # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+train_gpt_submit.py âval_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+tied_dup_from:2 (blocks 2..10 run twice with shared weights)
+model_params:26829913
+mtp_num_heads:0 mtp_loss_weight:0.2 mtp_params:0
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.035 head_lr:0.0 matrix_lr:0.025 scalar_lr:0.025
+train_batch_tokens:786432 train_seq_len:2048 iterations:9000 warmup_steps:20 max_wallclock_seconds:3600.000
+seed:42
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/9000 val_loss:6.9307 val_bpb:4.1047 train_time:0ms step_avg:0.02ms
+step:1/9000 train_loss:6.9317 train_time:5725ms step_avg:5725.01ms
+step:2/9000 train_loss:8.2990 train_time:11601ms step_avg:5800.71ms
+step:3/9000 train_loss:7.4995 train_time:17483ms step_avg:5827.63ms
+step:4/9000 train_loss:7.2579 train_time:23365ms step_avg:5841.34ms
+step:5/9000 train_loss:7.0536 train_time:29249ms step_avg:5849.70ms
+step:6/9000 train_loss:6.9766 train_time:35128ms step_avg:5854.70ms
+step:7/9000 train_loss:6.9416 train_time:41017ms step_avg:5859.63ms
+step:8/9000 train_loss:6.7737 train_time:46901ms step_avg:5862.62ms
+step:9/9000 train_loss:6.4434 train_time:52778ms step_avg:5864.26ms
+step:10/9000 train_loss:6.1737 train_time:58660ms step_avg:5866.03ms
+step:200/9000 train_loss:2.7528 train_time:1176448ms step_avg:5882.24ms
+step:400/9000 train_loss:2.5114 train_time:2352721ms step_avg:5881.80ms
+late_qat:enabled step:586 scale:0.1000
+step:600/9000 train_loss:2.3091 train_time:3529406ms step_avg:5882.34ms
+step:613/9000 val_loss:2.3285 val_bpb:1.3790 train_time:3605867ms step_avg:5882.33ms
+stopping_early: wallclock_cap train_time:3605867ms step:613/9000
+peak memory allocated: 40736 MiB reserved: 40840 MiB
+ema:applying EMA weights
+Serialized model: 105783807 bytes
+Code size: 81744 bytes
+Serialized model int6+zstd: 12456805 bytes
+Total submission size int6+zstd: 12538549 bytes
+final_int6_roundtrip val_loss:3.8122 val_bpb:2.2578 eval_time:89523ms
+final_int6_roundtrip_exact val_loss:3.81223444 val_bpb:2.25781997
+ttt:setup mode=online+duplicate lr=0.002 momentum=0.9 freeze_blocks=2
+ttt:duplicated 9 blocks (indices 2..10)
+HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -1911,3 +1897,87 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.12.3 (main, Nov  6 2025, 13:44:16) [GCC 13.3.0]
+Running PyTorch 2.9.1+cu128
+Mon Mar 23 19:51:46 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 575.57.08              Driver Version: 575.57.08      CUDA Version: 12.9     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A40                     On  |   00000000:D6:00.0 Off |                    0 |
+|  0%   48C    P0             60W /  300W |     269MiB /  46068MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+tied_dup_from:2 (blocks 2..10 run twice with shared weights)
+model_params:26829913
+mtp_num_heads:0 mtp_loss_weight:0.2 mtp_params:0
+world_size:1 grad_accum_steps:8
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.035 head_lr:0.0 matrix_lr:0.025 scalar_lr:0.025
+train_batch_tokens:786432 train_seq_len:2048 iterations:9000 warmup_steps:20 max_wallclock_seconds:3600.000
+seed:42
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/9000 val_loss:6.9307 val_bpb:4.1047 train_time:0ms step_avg:0.02ms
+step:1/9000 train_loss:6.9317 train_time:5725ms step_avg:5725.01ms
+step:2/9000 train_loss:8.2990 train_time:11601ms step_avg:5800.71ms
+step:3/9000 train_loss:7.4995 train_time:17483ms step_avg:5827.63ms
+step:4/9000 train_loss:7.2579 train_time:23365ms step_avg:5841.34ms
+step:5/9000 train_loss:7.0536 train_time:29249ms step_avg:5849.70ms
+step:6/9000 train_loss:6.9766 train_time:35128ms step_avg:5854.70ms
+step:7/9000 train_loss:6.9416 train_time:41017ms step_avg:5859.63ms
+step:8/9000 train_loss:6.7737 train_time:46901ms step_avg:5862.62ms
+step:9/9000 train_loss:6.4434 train_time:52778ms step_avg:5864.26ms
+step:10/9000 train_loss:6.1737 train_time:58660ms step_avg:5866.03ms
+step:200/9000 train_loss:2.7528 train_time:1176448ms step_avg:5882.24ms
+step:400/9000 train_loss:2.5114 train_time:2352721ms step_avg:5881.80ms
+late_qat:enabled step:586 scale:0.1000
+step:600/9000 train_loss:2.3091 train_time:3529406ms step_avg:5882.34ms
+step:613/9000 val_loss:2.3285 val_bpb:1.3790 train_time:3605867ms step_avg:5882.33ms
+stopping_early: wallclock_cap train_time:3605867ms step:613/9000
+peak memory allocated: 40736 MiB reserved: 40840 MiB
+ema:applying EMA weights
+Serialized model: 105783807 bytes
+Code size: 81744 bytes
+Serialized model int6+zstd: 12456805 bytes
+Total submission size int6+zstd: 12538549 bytes
+final_int6_roundtrip val_loss:3.8122 val_bpb:2.2578 eval_time:89523ms
+final_int6_roundtrip_exact val_loss:3.81223444 val_bpb:2.25781997
+ttt:setup mode=online+duplicate lr=0.002 momentum=0.9 freeze_blocks=2
+ttt:duplicated 9 blocks (indices 2..10)

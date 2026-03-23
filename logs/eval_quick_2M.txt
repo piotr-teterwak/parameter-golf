@@ -1,0 +1,29 @@
+val_tokens: 1998849 / 62021633 (3.2%)
+loading model from final_model.int6.ptz
+
+=== Mode 1: No TTT (sliding window) ===
+no_ttt: val_loss=2.3219 val_bpb=1.3914 time=123.5s
+
+=== Mode 2: TTT online in-place (no duplication) ===
+ttt_online: 3123/31232 (10%) avg_loss:2.3049 resets:164 time:198.0s
+ttt_online: 6246/31232 (20%) avg_loss:2.2774 resets:347 time:398.3s
+ttt_online: 9369/31232 (30%) avg_loss:2.2985 resets:534 time:594.9s
+ttt_online: 12492/31232 (40%) avg_loss:2.2895 resets:685 time:788.6s
+ttt_online: 15615/31232 (50%) avg_loss:2.3092 resets:870 time:985.7s
+ttt_online: 18738/31232 (60%) avg_loss:2.3069 resets:1018 time:1183.5s
+ttt_online: 21861/31232 (70%) avg_loss:2.3020 resets:1168 time:1377.6s
+ttt_online: 24984/31232 (80%) avg_loss:2.2993 resets:1331 time:1572.7s
+ttt_online: 28107/31232 (90%) avg_loss:2.3102 resets:1454 time:1770.1s
+ttt_online: 31230/31232 (100%) avg_loss:2.3089 resets:1628 time:1966.9s
+ttt_online:done windows:31232 elapsed:1967.1s
+ttt_inplace: val_loss=2.3089 val_bpb=1.3836 time=1967.1s
+
+=== Mode 3: TTT online duplicate ===
+ttt:duplicated 9 blocks (indices 2..10)
+ttt_online: 3123/31232 (10%) avg_loss:3.1221 resets:164 time:276.6s
+ttt_online: 6246/31232 (20%) avg_loss:3.1200 resets:347 time:550.0s
+ttt_online: 9369/31232 (30%) avg_loss:3.1521 resets:534 time:858.5s
+ttt_online: 12492/31232 (40%) avg_loss:3.1349 resets:685 time:1205.7s
+ttt_online: 15615/31232 (50%) avg_loss:3.1629 resets:870 time:1515.1s
+ttt_online: 18738/31232 (60%) avg_loss:3.1518 resets:1018 time:1826.8s
+ttt_online: 21861/31232 (70%) avg_loss:3.1446 resets:1168 time:2094.4s
