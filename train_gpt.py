@@ -1248,9 +1248,11 @@ def eval_val_sliding_with_ttt(
     ttt_params = [p for p in base_model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
 
-    # Detach is not safe here: embeddings and non-frozen original blocks are
-    # trainable in both in-place and duplicate modes, so we need full backprop.
-    detach_block = -1
+    # Save initial param values for reset at document boundaries
+    init_state = {id(p): p.data.clone() for p in ttt_params}
+
+    # Precompute document boundary mask over val_tokens
+    boundary_mask = is_boundary_token_lut[val_tokens.to(device=device, dtype=torch.int64)]
 
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -1263,21 +1265,34 @@ def eval_val_sliding_with_ttt(
     base_model.train()
     t0 = time.perf_counter()
     log_every = max(1, total_windows // 10)
+    num_resets = 0
 
     for wi, ws in enumerate(window_starts):
         end = min(ws + seq_len, total_tokens)
         wlen = end - ws
         chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
 
+        # Check if scored region contains a document boundary -> reset
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        scored_start = ws + s
+        scored_end = ws + wlen
+        if boundary_mask[scored_start:scored_end].any():
+            # Reset params to initial values and clear optimizer state
+            with torch.no_grad():
+                for p in ttt_params:
+                    p.data.copy_(init_state[id(p)])
+            optimizer.state.clear()
+            num_resets += 1
+
         x.zero_()
         y.zero_()
         x[0, :wlen] = chunk[:-1]
         y[0, :wlen] = chunk[1:]
 
-        # Forward pass (detach after frozen blocks to save backward compute)
+        # Forward pass
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = base_model.forward_logits(x, detach_after_block=detach_block)
+            logits = base_model.forward_logits(x)
 
         nll = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)).float(),
@@ -1286,7 +1301,6 @@ def eval_val_sliding_with_ttt(
         ).reshape(1, seq_len)
 
         # Step 1: SCORE the new tokens (before adaptation)
-        s = 0 if ws == 0 else max(wlen - stride, 0)
         scored_nll = nll[0, s:wlen].detach().to(torch.float64)
         loss_sum += scored_nll.sum()
         token_count += float(wlen - s)
@@ -1306,7 +1320,7 @@ def eval_val_sliding_with_ttt(
             elapsed = time.perf_counter() - t0
             pct = 100.0 * (wi + 1) / total_windows
             avg_loss = (loss_sum / token_count).item()
-            log_fn(f"ttt_online: {wi+1}/{total_windows} ({pct:.0f}%) avg_loss:{avg_loss:.4f} time:{elapsed:.1f}s")
+            log_fn(f"ttt_online: {wi+1}/{total_windows} ({pct:.0f}%) avg_loss:{avg_loss:.4f} resets:{num_resets} time:{elapsed:.1f}s")
 
     # All GPUs process all windows identically — no all-reduce needed
 
