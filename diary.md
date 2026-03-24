@@ -240,3 +240,44 @@ Comparison with non-dup model:
 - Net: TTT gains don't compensate for the training deficit on a fixed wall-clock budget.
 - TTT in-place beats TTT duplicate — the weight tying acts as a regularizer that helps with short documents + frequent resets.
 - The "free parameters" from duplication (~21M) aren't valuable enough given limited TTT adaptation per document.
+
+## Untied-duplicate experiment (2026-03-24)
+
+### Motivation
+
+Test whether training with 20 layers (no weight tying) performs better than tied-duplicate training, given the same 1-hour wall-clock budget. This is the standard non-dup architecture but scaled to 20 layers — no `TIED_DUP_FROM`, duplication only happens at TTT via deep-copy.
+
+### Training
+
+```bash
+env \
+  NUM_LAYERS=20 BIGRAM_VOCAB_SIZE=2048 XSA_LAST_N=4 \
+  EMA_ENABLED=1 EMA_DECAY=0.997 ROPE_DIMS=16 LN_SCALE=1 LATE_QAT=1 QAT_THRESHOLD=0.1 \
+  MUON_WD=0.04 ADAM_WD=0.04 MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
+  MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 MUON_MOMENTUM_WARMUP_STEPS=115 \
+  WARMDOWN_ITERS=230 ITERATIONS=9000 MAX_WALLCLOCK_SECONDS=3600 EVAL_STRIDE=64 SEED=42 \
+  TTT_ENABLED=1 TTT_ONLINE=1 TTT_DUPLICATE=1 \
+  TTT_LR=0.002 TTT_MOMENTUM=0.9 TTT_FREEZE_BLOCKS=2 \
+  RUN_ID=1hr_untieddup_s42 \
+  python3 train_gpt.py 2>&1 | tee logs/1hr_untieddup_s42.txt
+```
+
+- ~5.90s/step (similar to tied-dup since 20 real layers ≈ 11 tied-dup layers in compute)
+- 611 steps in 3604s, `grad_accum_steps=8`
+- Model size: 190MB full / 22MB int6+zstd (vs 106MB/12MB for tied-dup — nearly 2x due to untied weights)
+
+### Training loss comparison vs tied-duplicate
+
+| Step | Untied (20L) | Tied-dup (11L×2) | Delta |
+|---|---|---|---|
+| 200 | 2.7407 | 2.7528 | -0.012 |
+| 400 | 2.5070 | 2.5114 | -0.004 |
+| 600 | 2.2917 | 2.3091 | -0.017 |
+| **Final val** | **2.3100 (1.3681 BPB)** | **2.3285 (1.3790 BPB)** | **-0.011 BPB** |
+
+### Preliminary conclusions
+
+- Untied 20L consistently beats tied-dup 11L in training loss — having independent weights helps even at the same effective depth.
+- Final val BPB 1.3681 vs 1.3790 — a meaningful 0.011 gap.
+- But the model is ~2x larger (22MB vs 12MB int6+zstd), which may matter for submission size limits.
+- TTT sliding window eval not yet available — need to compare final BPB with TTT to see if the gains hold.
